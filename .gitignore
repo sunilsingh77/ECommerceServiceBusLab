@@ -1,0 +1,52 @@
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+# NuGet
+*.nupkg
+packages/
+.nuget/
+
+# Visual Studio cache
+*.cache
+*.log
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+appsettings.Development.json
+secrets.json
+
+# Publish output
+publish/
+artifacts/
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Azure local settings
+local.settings.json
