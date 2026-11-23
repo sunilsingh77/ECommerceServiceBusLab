@@ -1,6 +1,9 @@
 ﻿
 using Azure.Messaging.ServiceBus;
 using ECommerce.Contracts;
+using InventoryConsumer.Worker.Data;
+using InventoryConsumer.Worker.Models;
+using Microsoft.EntityFrameworkCore;
 
 namespace InventoryConsumer.Worker.Workers;
 
@@ -9,12 +12,17 @@ public class InventoryProcessor : BackgroundService
     private readonly ServiceBusClient _client;
     private readonly IConfiguration _configuration;
     private readonly ILogger<InventoryProcessor> _logger;
-
-    public InventoryProcessor(ServiceBusClient client, IConfiguration configuration, ILogger<InventoryProcessor> logger)
+    private readonly IServiceScopeFactory _scopeFactory;
+    public InventoryProcessor(
+        ServiceBusClient client,
+        IConfiguration configuration,
+        ILogger<InventoryProcessor> logger,
+        IServiceScopeFactory scopeFactory)
     {
         _client = client;
         _configuration = configuration;
         _logger = logger;
+        _scopeFactory = scopeFactory;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -53,42 +61,135 @@ public class InventoryProcessor : BackgroundService
         }
     }
 
+
     private async Task ProcessMessageAsync(
         ProcessMessageEventArgs args)
     {
         try
         {
-            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
+            var order = args.Message.Body
+                .ToObjectFromJson<OrderCreatedEvent>();
 
-            if (order is null)
-                throw new InvalidOperationException("Invalid order message.");
+            if (order is null ||
+                order.OrderId == Guid.Empty ||
+                order.TotalAmount <= 0)
+            {
+                await args.DeadLetterMessageAsync(
+                    args.Message,
+                    "InvalidOrder",
+                    "Order contains invalid data.");
 
-            _logger.LogInformation("Inventory Service received Order: {OrderId}",
-                order.OrderId);
+                return;
+            }
 
             _logger.LogInformation(
-                "Reserving inventory for Customer: {Customer}, Amount: {Amount}",
-                order.CustomerName,
-                order.TotalAmount);
-
-            // Simulate inventory reservation.
-            await Task.Delay(1000, args.CancellationToken);
-
-            _logger.LogInformation(
-                "Inventory reserved successfully for Order: {OrderId}",
+                "Inventory Service received Order: {OrderId}",
                 order.OrderId);
 
-            await args.CompleteMessageAsync(args.Message);
+            // Resolve InventoryDbContext from a DI scope.
+            await using var scope = _scopeFactory.CreateAsyncScope();
+
+            var dbContext = scope.ServiceProvider
+                .GetRequiredService<InventoryDbContext>();
+
+            // Use original event identity across retries/replays.
+            var eventId =
+                args.Message.ApplicationProperties.TryGetValue(
+                    "OriginalMessageId", out var originalId)
+                    ? originalId?.ToString() ?? args.Message.MessageId
+                    : args.Message.MessageId;
+
+            _logger.LogInformation(
+                "Processing inventory event. EventId: {EventId}",
+                eventId);
+
+            // STEP 1: Check Inbox.
+            var alreadyProcessed = await dbContext.InboxMessages
+                .AnyAsync(
+                    x => x.MessageId == eventId,
+                    args.CancellationToken);
+
+            if (alreadyProcessed)
+            {
+                _logger.LogWarning(
+                    "Duplicate inventory event detected. EventId: {EventId}. Skipping reservation.",
+                    eventId);
+
+                await args.CompleteMessageAsync(args.Message);
+                return;
+            }
+
+            // STEP 2: Start local InventoryDb transaction.
+            await using var transaction =
+                await dbContext.Database.BeginTransactionAsync(
+                    args.CancellationToken);
+
+            try
+            {
+                _logger.LogInformation(
+                    "Reserving inventory for Customer: {Customer}, Amount: {Amount}",
+                    order.CustomerName,
+                    order.TotalAmount);
+
+                // STEP 3: Perform inventory business operation.
+                var reservation = new InventoryReservation
+                {
+                    ReservationId = Guid.NewGuid(),
+                    OrderId = order.OrderId,
+                    CustomerName = order.CustomerName,
+                    TotalAmount = order.TotalAmount,
+                    ReservationStatus = "Reserved",
+                    CreatedAt = DateTime.UtcNow
+                };
+
+                dbContext.InventoryReservations.Add(reservation);
+
+                // STEP 4: Record event in Inbox.
+                dbContext.InboxMessages.Add(new InboxMessage
+                {
+                    MessageId = eventId,
+                    ProcessedOnUtc = DateTime.UtcNow,
+                    ConsumerName = "InventoryConsumer"
+                });
+
+                await dbContext.SaveChangesAsync(args.CancellationToken);
+
+                // STEP 5: Commit reservation and Inbox together.
+                await transaction.CommitAsync(args.CancellationToken);
+
+                _logger.LogInformation(
+                    "Inventory reservation and Inbox committed. OrderId: {OrderId}, EventId: {EventId}",
+                    order.OrderId,
+                    eventId);
+
+                // STEP 6: Complete Service Bus message.
+                await args.CompleteMessageAsync(args.Message);
+                // STEP 6: Complete Service Bus message.
+                await args.CompleteMessageAsync(args.Message);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(args.CancellationToken);
+                throw;
+            }
+        }
+        catch (OperationCanceledException)
+            when (args.CancellationToken.IsCancellationRequested)
+        {
+            _logger.LogInformation(
+                "Inventory processing cancelled during shutdown.");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex,
+            _logger.LogError(
+                ex,
                 "Inventory processing failed. MessageId: {MessageId}",
                 args.Message.MessageId);
 
             await args.AbandonMessageAsync(args.Message);
         }
     }
+
 
     private Task ProcessErrorAsync(ProcessErrorEventArgs args)
     {
