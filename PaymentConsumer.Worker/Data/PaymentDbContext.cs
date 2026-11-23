@@ -12,6 +12,7 @@ public class PaymentDbContext : DbContext
     }
 
     public DbSet<PaymentTransaction> PaymentTransactions => Set<PaymentTransaction>();
+    public DbSet<InboxMessage> InboxMessages => Set<InboxMessage>();
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -38,6 +39,20 @@ public class PaymentDbContext : DbContext
 
             entity.Property(x => x.PaymentReference)
                 .HasMaxLength(100);
+        });
+        modelBuilder.Entity<InboxMessage>(entity =>
+        {
+            entity.ToTable("InboxMessages");
+
+            entity.HasKey(x => x.MessageId);
+
+            entity.Property(x => x.MessageId)
+                .HasMaxLength(128)
+                .IsRequired();
+
+            entity.Property(x => x.ConsumerName)
+                .HasMaxLength(100)
+                .IsRequired();
         });
     }
 }

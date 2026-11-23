@@ -7,6 +7,8 @@
   <Project Path="NotificationConsumer.Worker/NotificationConsumer.Worker.csproj" />
   <Project Path="OrderConsumer.Worker/OrderConsumer.Worker.csproj" />
   <Project Path="OrderProducer.Api/OrderProducer.Api.csproj" />
+  <Project Path="OrderSessionLab/OrderSessionLab.csproj" />
   <Project Path="PaymentConsumer.Worker/PaymentConsumer.Worker.csproj" />
   <Project Path="PaymentDlqRecovery.Tool/PaymentDlqRecovery.Tool.csproj" />
+  <Project Path="ServiceBusTransactionLab/ServiceBusTransactionLab.csproj" />
 </Solution>

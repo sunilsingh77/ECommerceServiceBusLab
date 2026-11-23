@@ -1,9 +1,11 @@
 ﻿
 using Azure.Messaging.ServiceBus;
 using ECommerce.Contracts;
+using PaymentConsumer.Worker.Data;
 using PaymentConsumer.Worker.Exceptions;
+using PaymentConsumer.Worker.Models;
 using PaymentConsumer.Worker.Services;
-
+using Microsoft.EntityFrameworkCore;
 namespace PaymentConsumer.Worker.Workers;
 
 public class PaymentProcessor : BackgroundService
@@ -81,6 +83,7 @@ public class PaymentProcessor : BackgroundService
         }
     }
 
+
     private async Task ProcessMessageAsync(
         ProcessMessageEventArgs args,
         ServiceBusSender retrySender)
@@ -102,41 +105,109 @@ public class PaymentProcessor : BackgroundService
                 return;
             }
 
-            _logger.LogInformation(
-                "Processing payment for Order: {OrderId}",
-                order.OrderId);
-
+            // Resolve PaymentDbContext and PaymentGatewayService
+            // from the same DI scope.
             await using var scope = _scopeFactory.CreateAsyncScope();
-            var paymentGateway = scope.ServiceProvider.GetRequiredService<PaymentGatewayService>();
 
-            await paymentGateway.ProcessPaymentAsync(
-                order.OrderId,
-                order.CustomerName,
-                order.TotalAmount,
-                args.CancellationToken);
+            var dbContext = scope.ServiceProvider
+                .GetRequiredService<PaymentDbContext>();
+
+            var paymentGateway = scope.ServiceProvider
+                .GetRequiredService<PaymentGatewayService>();
+
+            // Resolve stable event identity across retries/replays.
+            var eventId =
+                args.Message.ApplicationProperties.TryGetValue(
+                    "OriginalMessageId", out var originalId)
+                    ? originalId?.ToString() ?? args.Message.MessageId
+                    : args.Message.MessageId;
 
             _logger.LogInformation(
-                "Payment successful for Order: {OrderId}",
-                order.OrderId);
+                "Processing payment for Order: {OrderId}, EventId: {EventId}",
+                order.OrderId,
+                eventId);
 
-            if (order.CustomerName.Equals(
-                "CRASHONCE",
-                StringComparison.OrdinalIgnoreCase)
-                && Interlocked.Exchange(ref _crashSimulationTriggered, 1) == 0)
+            // STEP 1: Check Inbox.
+            var alreadyProcessed = await dbContext.InboxMessages
+                .AnyAsync(
+                    x => x.MessageId == eventId,
+                    args.CancellationToken);
+
+            if (alreadyProcessed)
             {
-                _logger.LogError(
-                    "SIMULATED CRASH: Payment succeeded, but message completion did not happen. OrderId: {OrderId}",
-                    order.OrderId);
+                _logger.LogWarning(
+                    "Duplicate message detected. EventId: {EventId}. Skipping payment.",
+                    eventId);
 
-                throw new Exception(
-                    "Simulated consumer crash after successful payment.");
+                await args.CompleteMessageAsync(args.Message);
+                return;
             }
 
-            await args.CompleteMessageAsync(args.Message);
+            // STEP 2: Start SQL transaction.
+            await using var transaction =
+                await dbContext.Database.BeginTransactionAsync(
+                    args.CancellationToken);
+            try
+            {
+                // STEP 3: Process payment.
+                // PaymentGatewayService must use this same scoped DbContext.
+                await paymentGateway.ProcessPaymentAsync(
+                    order.OrderId,
+                    order.CustomerName,
+                    order.TotalAmount,
+                    args.CancellationToken);
+
+                _logger.LogInformation(
+                    "Payment successful for Order: {OrderId}",
+                    order.OrderId);
+
+                // STEP 4: Add Inbox record.
+                dbContext.InboxMessages.Add(new InboxMessage
+                {
+                    MessageId = eventId,
+                    ProcessedOnUtc = DateTime.UtcNow,
+                    ConsumerName = "PaymentConsumer"
+                });
+
+                await dbContext.SaveChangesAsync(args.CancellationToken);
+
+                // STEP 5: Commit payment + Inbox together.
+                await transaction.CommitAsync(args.CancellationToken);
+
+                _logger.LogInformation(
+                    "Payment and Inbox committed. OrderId: {OrderId}, EventId: {EventId}",
+                    order.OrderId,
+                    eventId);
+
+                // STEP 6: Preserve your existing crash simulation.
+                if (order.CustomerName.Equals(
+                    "CRASHONCE",
+                    StringComparison.OrdinalIgnoreCase)
+                    && Interlocked.Exchange(
+                        ref _crashSimulationTriggered, 1) == 0)
+                {
+                    _logger.LogError(
+                        "SIMULATED CRASH: Payment and Inbox committed, but message completion did not happen. OrderId: {OrderId}",
+                        order.OrderId);
+
+                    throw new Exception(
+                        "Simulated consumer crash after successful payment and Inbox commit.");
+                }
+
+                // STEP 7: Complete Service Bus message.
+                await args.CompleteMessageAsync(args.Message);
+            }
+            catch
+            {
+                await transaction.RollbackAsync(args.CancellationToken);
+                throw;
+            }
         }
         catch (TransientPaymentException ex)
         {
-            var retryCount = args.Message.ApplicationProperties.TryGetValue("RetryCount", out var value)
+            var retryCount =
+                args.Message.ApplicationProperties.TryGetValue(
+                    "RetryCount", out var value)
                     ? Convert.ToInt32(value)
                     : 0;
 
@@ -157,11 +228,12 @@ public class PaymentProcessor : BackgroundService
 
             var nextRetry = retryCount + 1;
 
-            // 5, 10, 20 seconds
+            // 5, 10, 20 seconds.
             var delaySeconds = 5 * Math.Pow(2, retryCount);
 
             var originalMessageId =
-                args.Message.ApplicationProperties.TryGetValue("OriginalMessageId", out var originalId)
+                args.Message.ApplicationProperties.TryGetValue(
+                    "OriginalMessageId", out var originalId)
                     ? originalId?.ToString() ?? args.Message.MessageId
                     : args.Message.MessageId;
 
@@ -175,13 +247,16 @@ public class PaymentProcessor : BackgroundService
 
             foreach (var property in args.Message.ApplicationProperties)
             {
-                retryMessage.ApplicationProperties[property.Key] = property.Value;
+                retryMessage.ApplicationProperties[property.Key] =
+                    property.Value;
             }
 
             retryMessage.ApplicationProperties["RetryCount"] = nextRetry;
-            retryMessage.ApplicationProperties["OriginalMessageId"] = originalMessageId;
+            retryMessage.ApplicationProperties["OriginalMessageId"] =
+                originalMessageId;
 
-            var scheduledTime = DateTimeOffset.UtcNow.AddSeconds(delaySeconds);
+            var scheduledTime =
+                DateTimeOffset.UtcNow.AddSeconds(delaySeconds);
 
             await retrySender.ScheduleMessageAsync(
                 retryMessage,
@@ -193,7 +268,6 @@ public class PaymentProcessor : BackgroundService
                 nextRetry,
                 delaySeconds);
 
-            // Complete original only after retry scheduling succeeds.
             await args.CompleteMessageAsync(args.Message);
         }
         catch (PermanentPaymentException ex)
