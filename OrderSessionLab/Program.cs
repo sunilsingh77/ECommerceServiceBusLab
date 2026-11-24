@@ -34,24 +34,52 @@ await using var processor = client.CreateSessionProcessor(queueName,
                                                         });
 
 // STEP 2: Register message handler.
+
 processor.ProcessMessageAsync += async args =>
 {
     var message = args.Message;
+    var sessionId = message.SessionId;
+    var eventName = message.Body.ToString();
 
     Console.WriteLine(
-        $"START | Session: {message.SessionId} | " +
-        $"Message: {message.Body}");
+        $"START | Session: {sessionId} | Message: {eventName} | " +
+        $"DeliveryCount: {message.DeliveryCount}");
 
-    // Simulate business processing.
-    await Task.Delay(1500, args.CancellationToken);
+    if (eventName == "InventoryReserved")
+    {
+        Console.WriteLine(
+            $"Long-running inventory reservation started: {sessionId}");
+
+        await Task.Delay(
+            TimeSpan.FromSeconds(90),
+            args.CancellationToken);
+
+        Console.WriteLine(
+            $"Long-running inventory reservation completed: {sessionId}");
+    }
+    else
+    {
+        await Task.Delay(1500, args.CancellationToken);
+    }
+
+    // Simulate one failure for ORDER-101 PaymentCompleted.
+    if (sessionId == "ORDER-101" &&
+        eventName == "PaymentCompleted" &&
+        message.DeliveryCount == 1)
+    {
+        Console.WriteLine(
+            $"FAIL  | Session: {sessionId} | Message: {eventName}");
+
+        await args.AbandonMessageAsync(message);
+        return;
+    }
 
     Console.WriteLine(
-        $"DONE  | Session: {message.SessionId} | " +
-        $"Message: {message.Body}");
+        $"DONE  | Session: {sessionId} | Message: {eventName}");
 
-    // Manually settle the message.
     await args.CompleteMessageAsync(message);
 };
+
 
 // STEP 3: Register error handler.
 processor.ProcessErrorAsync += args =>
@@ -95,6 +123,11 @@ Console.WriteLine();
 Console.WriteLine("Waiting for session processing...");
 
 // Allow enough time for both sessions to finish.
-await Task.Delay(TimeSpan.FromSeconds(20));
+Console.WriteLine("Waiting for long-running session processing...");
+
+// Allow enough time for 90-second operations.
+await Task.Delay(TimeSpan.FromSeconds(110));
+
 await processor.StopProcessingAsync();
+
 Console.WriteLine("Session processor stopped.");

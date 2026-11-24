@@ -10,5 +10,6 @@
   <Project Path="OrderSessionLab/OrderSessionLab.csproj" />
   <Project Path="PaymentConsumer.Worker/PaymentConsumer.Worker.csproj" />
   <Project Path="PaymentDlqRecovery.Tool/PaymentDlqRecovery.Tool.csproj" />
+  <Project Path="ServiceBusDuplicateDetectionLab/ServiceBusDuplicateDetectionLab.csproj" />
   <Project Path="ServiceBusTransactionLab/ServiceBusTransactionLab.csproj" />
 </Solution>
