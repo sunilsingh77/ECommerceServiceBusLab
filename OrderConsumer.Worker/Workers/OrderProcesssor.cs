@@ -3,15 +3,15 @@ using Azure.Messaging.ServiceBus;
 using ECommerce.Contracts;
 using System.Text.Json;
 
-namespace OrderConsumer.Worker;
+namespace OrderConsumer.Worker.Workers;
 
-public class Worker : BackgroundService
+public class OrderProcesssor : BackgroundService
 {
     private readonly ServiceBusClient _client;
     private readonly IConfiguration _configuration;
-    private readonly ILogger<Worker> _logger;
+    private readonly ILogger<OrderProcesssor> _logger;
 
-    public Worker(ServiceBusClient client, IConfiguration configuration, ILogger<Worker> logger)
+    public OrderProcesssor(ServiceBusClient client, IConfiguration configuration, ILogger<OrderProcesssor> logger)
     {
         _client = client;
         _configuration = configuration;
@@ -50,35 +50,36 @@ public class Worker : BackgroundService
     }
     private async Task ProcessMessageAsync(ProcessMessageEventArgs args)
     {
+        var correlationId = args.Message.CorrelationId;
+
+        if (string.IsNullOrWhiteSpace(correlationId) &&
+            args.Message.ApplicationProperties.TryGetValue(
+                "CorrelationId", out var correlationValue))
+        {
+            correlationId = correlationValue?.ToString();
+        }
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            correlationId = args.Message.MessageId;
+        }
+
+        using var logScope = _logger.BeginScope(
+                                                new Dictionary<string, object?>
+                                                {
+                                                    ["CorrelationId"] = correlationId,
+                                                    ["MessageId"] = args.Message.MessageId,
+                                                    ["DeliveryCount"] = args.Message.DeliveryCount,
+                                                    ["Consumer"] = "OrderConsumer"
+                                                });
         try
         {
-            var correlationId = args.Message.CorrelationId;
-
-            if (string.IsNullOrWhiteSpace(correlationId) &&
-                args.Message.ApplicationProperties.TryGetValue(
-                    "CorrelationId", out var correlationValue))
-            {
-                correlationId = correlationValue?.ToString();
-            }
-
-            if (string.IsNullOrWhiteSpace(correlationId))
-            {
-                correlationId = args.Message.MessageId;
-            }
-
-            using var logScope = _logger.BeginScope(
-                new Dictionary<string, object?>
-                {
-                    ["CorrelationId"] = correlationId,
-                    ["MessageId"] = args.Message.MessageId,
-                    ["Consumer"] = "OrderConsumer"
-                });
+            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
 
             _logger.LogInformation(
                 "Order message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
                 correlationId,
-                args.Message.MessageId);
-            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
+                order?.OrderId);
 
             // Scenario 1: Invalid message - permanent failure
             if (order is null || order.OrderId == Guid.Empty || string.IsNullOrWhiteSpace(order.CustomerName) || order.TotalAmount <= 0)
@@ -111,7 +112,7 @@ public class Worker : BackgroundService
             if (order.CustomerName.Equals("DEFER", StringComparison.OrdinalIgnoreCase))
             {
                 await DeferAndRetrieveAsync(args);
-                return;
+                //return;
             }
             // Simulate business processing
             await Task.Delay(1000, args.CancellationToken);
@@ -150,7 +151,18 @@ public class Worker : BackgroundService
     }
     private Task ProcessErrorAsync(ProcessErrorEventArgs args)
     {
-        _logger.LogError(args.Exception, "Service Bus error. Entity: {EntityPath}", args.EntityPath);
+        _logger.LogError(
+            args.Exception,
+            """
+            Service Bus processing error.
+            EntityPath: {EntityPath}
+            ErrorSource: {ErrorSource}
+            FullyQualifiedNamespace: {Namespace}
+            """,
+            args.EntityPath,
+            args.ErrorSource,
+            args.FullyQualifiedNamespace);
+
         return Task.CompletedTask;
     }
     private async Task DeferAndRetrieveAsync(

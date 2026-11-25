@@ -1,6 +1,6 @@
 
 using Azure.Messaging.ServiceBus;
-using OrderConsumer.Worker;
+using OrderConsumer.Worker.Workers;
 
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -14,7 +14,14 @@ builder.Services.AddSingleton<ServiceBusClient>(_ =>
     return new ServiceBusClient(connectionString);
 });
 
-builder.Services.AddHostedService<Worker>();
+builder.Logging.ClearProviders();
+builder.Logging.AddJsonConsole(options =>
+{
+    options.IncludeScopes = true;
+    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss ";
+});
+
+builder.Services.AddHostedService<OrderProcesssor>();
 
 var host = builder.Build();
 

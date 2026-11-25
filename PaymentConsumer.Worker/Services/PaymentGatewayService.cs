@@ -1,4 +1,3 @@
-﻿
 using Microsoft.EntityFrameworkCore;
 using PaymentConsumer.Worker.Data;
 using PaymentConsumer.Worker.Exceptions;
@@ -6,7 +5,7 @@ using PaymentConsumer.Worker.Models;
 
 namespace PaymentConsumer.Worker.Services;
 
-public class PaymentGatewayService
+public sealed class PaymentGatewayService
 {
     private readonly PaymentDbContext _dbContext;
     private readonly ILogger<PaymentGatewayService> _logger;
@@ -26,11 +25,12 @@ public class PaymentGatewayService
         string? correlationId,
         CancellationToken cancellationToken)
     {
-        // Step 1: Check whether payment already exists.
+        // Idempotency guard: do not attempt a second successful payment
+        // for the same OrderId.
         var existingPayment = await _dbContext.PaymentTransactions
             .AsNoTracking()
             .FirstOrDefaultAsync(
-                x => x.OrderId == orderId,
+                payment => payment.OrderId == orderId,
                 cancellationToken);
 
         if (existingPayment is not null)
@@ -38,7 +38,7 @@ public class PaymentGatewayService
             if (existingPayment.PaymentStatus == "Succeeded")
             {
                 _logger.LogWarning(
-                    "Duplicate payment request detected for Order: {OrderId}. Skipping charge.",
+                    "Duplicate payment request detected for OrderId {OrderId}; skipping gateway call",
                     orderId);
 
                 return;
@@ -48,31 +48,31 @@ public class PaymentGatewayService
                 $"Order {orderId} already has a payment with status {existingPayment.PaymentStatus}.");
         }
 
-        // Step 2: Simulate payment gateway failures.
-        //if (customerName.Equals(
-        //    "TEMPFAIL",
-        //    StringComparison.OrdinalIgnoreCase))
-        //{
-        //    throw new TransientPaymentException(
-        //        "Payment gateway temporarily unavailable (503).");
-        //}
-
+        // Keep the existing permanent-failure test scenario.
         if (customerName.Equals(
-            "INVALID",
-            StringComparison.OrdinalIgnoreCase))
+                "INVALID",
+                StringComparison.OrdinalIgnoreCase))
         {
-            throw new PermanentPaymentException(
-                "Invalid payment details.");
+            throw new PermanentPaymentException("Invalid payment details.");
         }
 
-        // Step 3: Simulate the payment gateway operation.
+        // TEMPFAIL simulation remains disabled as in the supplied source.
+        // Uncomment this block when you want to test the retry path.
+        //
+        // if (customerName.Equals("TEMPFAIL", StringComparison.OrdinalIgnoreCase))
+        // {
+        //     throw new TransientPaymentException(
+        //         "Payment gateway temporarily unavailable (503).");
+        // }
+
         _logger.LogInformation(
-            "Calling payment gateway. IdempotencyKey: {OrderId}",
+            "Calling payment gateway simulation. IdempotencyKey: {OrderId}",
             orderId);
 
-        await Task.Delay(500, cancellationToken);
+        await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
 
-        // Step 4: Save successful payment record.
+        var now = DateTime.UtcNow;
+
         var payment = new PaymentTransaction
         {
             PaymentId = Guid.NewGuid(),
@@ -81,8 +81,8 @@ public class PaymentGatewayService
             Amount = amount,
             PaymentStatus = "Succeeded",
             PaymentReference = $"PAY-{Guid.NewGuid():N}",
-            CreatedAt = DateTime.UtcNow,
-            UpdatedAt = DateTime.UtcNow,
+            CreatedAt = now,
+            UpdatedAt = now,
             CorrelationId = correlationId
         };
 
@@ -90,24 +90,40 @@ public class PaymentGatewayService
 
         try
         {
+            // This SaveChanges participates in the outer transaction
+            // opened by PaymentProcessor because the same DbContext is used.
             await _dbContext.SaveChangesAsync(cancellationToken);
-            _logger.LogInformation("Payment saved successfully. OrderId: {OrderId}, PaymentId: {PaymentId}", orderId, payment.PaymentId);
+
+            _logger.LogInformation(
+                "Payment transaction saved. OrderId: {OrderId}, PaymentId: {PaymentId}",
+                orderId,
+                payment.PaymentId);
         }
-        catch (DbUpdateException)
+        catch (DbUpdateException ex)
         {
-            // Another concurrent request may have inserted this OrderId.
-            // Verify whether the payment already exists.
+            // A concurrent delivery may have won the unique OrderId constraint.
+            // The caller's surrounding transaction will be rolled back if this
+            // is not a confirmed successful duplicate.
+            _logger.LogWarning(
+                ex,
+                "Payment insert encountered a database update conflict. Checking existing payment for OrderId {OrderId}",
+                orderId);
+
             var duplicate = await _dbContext.PaymentTransactions
                 .AsNoTracking()
                 .FirstOrDefaultAsync(
-                    x => x.OrderId == orderId,
+                    existing => existing.OrderId == orderId,
                     cancellationToken);
 
             if (duplicate?.PaymentStatus == "Succeeded")
             {
-                _logger.LogWarning("Duplicate payment prevented by database unique constraint. OrderId: {OrderId}", orderId);
+                _logger.LogWarning(
+                    "Duplicate payment prevented by database unique constraint. OrderId: {OrderId}",
+                    orderId);
+
                 return;
             }
+
             throw;
         }
     }

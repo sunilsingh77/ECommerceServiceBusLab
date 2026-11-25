@@ -1,4 +1,3 @@
-﻿
 using Azure.Messaging.ServiceBus;
 using ECommerce.Contracts;
 using InventoryConsumer.Worker.Data;
@@ -7,12 +6,13 @@ using Microsoft.EntityFrameworkCore;
 
 namespace InventoryConsumer.Worker.Workers;
 
-public class InventoryProcessor : BackgroundService
+public sealed class InventoryProcessor : BackgroundService
 {
     private readonly ServiceBusClient _client;
     private readonly IConfiguration _configuration;
     private readonly ILogger<InventoryProcessor> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+
     public InventoryProcessor(
         ServiceBusClient client,
         IConfiguration configuration,
@@ -27,10 +27,15 @@ public class InventoryProcessor : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var topicName = _configuration["ServiceBus:TopicName"] ?? throw new InvalidOperationException("Topic name missing.");
-        var subscriptionName = _configuration["ServiceBus:SubscriptionName"] ?? throw new InvalidOperationException("Subscription name missing.");
+        var topicName = _configuration["ServiceBus:TopicName"]
+            ?? throw new InvalidOperationException("Service Bus topic name is missing.");
 
-        await using var processor = _client.CreateProcessor(topicName, subscriptionName,
+        var subscriptionName = _configuration["ServiceBus:SubscriptionName"]
+            ?? throw new InvalidOperationException("Service Bus subscription name is missing.");
+
+        await using var processor = _client.CreateProcessor(
+            topicName,
+            subscriptionName,
             new ServiceBusProcessorOptions
             {
                 AutoCompleteMessages = false,
@@ -43,7 +48,7 @@ public class InventoryProcessor : BackgroundService
         await processor.StartProcessingAsync(stoppingToken);
 
         _logger.LogInformation(
-            "Inventory Consumer started. Listening to {Topic}/{Subscription}",
+            "Inventory consumer started. Listening to topic {TopicName}, subscription {SubscriptionName}",
             topicName,
             subscriptionName);
 
@@ -51,182 +56,205 @@ public class InventoryProcessor : BackgroundService
         {
             await Task.Delay(Timeout.Infinite, stoppingToken);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
-            // Expected during application shutdown.
+            _logger.LogInformation("Inventory consumer is stopping");
         }
         finally
         {
-            await processor.StopProcessingAsync();
+            await processor.StopProcessingAsync(CancellationToken.None);
+            _logger.LogInformation("Inventory Service Bus processor stopped");
         }
     }
 
-
-    private async Task ProcessMessageAsync(
-        ProcessMessageEventArgs args)
+    private async Task ProcessMessageAsync(ProcessMessageEventArgs args)
     {
+        var message = args.Message;
+        var correlationId = GetCorrelationId(message);
+
+        // Keep the logging scope alive through the catch block too.
+        using var logScope = _logger.BeginScope(new Dictionary<string, object?>
+        {
+            ["CorrelationId"] = correlationId,
+            ["MessageId"] = message.MessageId,
+            ["DeliveryCount"] = message.DeliveryCount,
+            ["Consumer"] = "InventoryConsumer",
+            ["EntityPath"] = args.EntityPath
+        });
+
         try
         {
-            var correlationId = args.Message.CorrelationId;
-
-            if (string.IsNullOrWhiteSpace(correlationId) &&
-                args.Message.ApplicationProperties.TryGetValue(
-                    "CorrelationId", out var correlationValue))
-            {
-                correlationId = correlationValue?.ToString();
-            }
-
-            if (string.IsNullOrWhiteSpace(correlationId))
-            {
-                correlationId = args.Message.MessageId;
-            }
-
-            using var logScope = _logger.BeginScope(
-                new Dictionary<string, object?>
-                {
-                    ["CorrelationId"] = correlationId,
-                    ["MessageId"] = args.Message.MessageId,
-                    ["Consumer"] = "InventoryConsumer"
-                });
-
             _logger.LogInformation(
-                "Inventory message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
+                "Inventory message received. MessageId: {MessageId}, CorrelationId: {CorrelationId}, DeliveryCount: {DeliveryCount}",
+                message.MessageId,
                 correlationId,
-                args.Message.MessageId);
+                message.DeliveryCount);
 
-            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
+            var order = message.Body.ToObjectFromJson<OrderCreatedEvent>();
 
             if (order is null ||
                 order.OrderId == Guid.Empty ||
                 order.TotalAmount <= 0)
             {
+                _logger.LogWarning(
+                    "Invalid order event. MessageId: {MessageId}; sending message to dead-letter queue",
+                    message.MessageId);
+
                 await args.DeadLetterMessageAsync(
-                    args.Message,
+                    message,
                     "InvalidOrder",
-                    "Order contains invalid data.");
+                    "Order contains invalid data.",
+                    args.CancellationToken);
 
                 return;
             }
 
+            using var orderScope = _logger.BeginScope(
+                new Dictionary<string, object?> { ["OrderId"] = order.OrderId });
+
             _logger.LogInformation(
-                "Inventory Service received Order: {OrderId}",
+                "Processing inventory event for OrderId {OrderId}",
                 order.OrderId);
 
-            // Resolve InventoryDbContext from a DI scope.
             await using var scope = _scopeFactory.CreateAsyncScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<InventoryDbContext>();
 
-            var dbContext = scope.ServiceProvider
-                .GetRequiredService<InventoryDbContext>();
+            // Preserve the original event identity when a retry/replay message carries it.
+            var eventId = message.ApplicationProperties.TryGetValue(
+                "OriginalMessageId",
+                out var originalId)
+                    ? originalId?.ToString() ?? message.MessageId
+                    : message.MessageId;
 
-            // Use original event identity across retries/replays.
-            var eventId =
-                args.Message.ApplicationProperties.TryGetValue(
-                    "OriginalMessageId", out var originalId)
-                    ? originalId?.ToString() ?? args.Message.MessageId
-                    : args.Message.MessageId;
+            _logger.LogDebug("Resolved inventory event identity {EventId}", eventId);
 
-            _logger.LogInformation(
-                "Processing inventory event. EventId: {EventId}",
-                eventId);
-
-            // STEP 1: Check Inbox.
             var alreadyProcessed = await dbContext.InboxMessages
-                .AnyAsync(
-                    x => x.MessageId == eventId,
-                    args.CancellationToken);
+                .AnyAsync(x => x.MessageId == eventId, args.CancellationToken);
 
             if (alreadyProcessed)
             {
                 _logger.LogWarning(
-                    "Duplicate inventory event detected. EventId: {EventId}. Skipping reservation.",
+                    "Duplicate inventory event detected for EventId {EventId}; reservation will be skipped",
                     eventId);
 
-                await args.CompleteMessageAsync(args.Message);
+                await args.CompleteMessageAsync(message, args.CancellationToken);
                 return;
             }
 
-
-            // STEP 2: Start local InventoryDb transaction.
-            await using var transaction = await dbContext.Database.BeginTransactionAsync(args.CancellationToken);
-            try
+            await using (var transaction =
+                await dbContext.Database.BeginTransactionAsync(args.CancellationToken))
             {
-                _logger.LogInformation(
-                    "Reserving inventory for Customer: {Customer}, Amount: {Amount}",
-                    order.CustomerName,
-                    order.TotalAmount);
-
-                // STEP 3: Perform inventory business operation.
-                var reservation = new InventoryReservation
+                try
                 {
-                    ReservationId = Guid.NewGuid(),
-                    OrderId = order.OrderId,
-                    CustomerName = order.CustomerName,
-                    TotalAmount = order.TotalAmount,
-                    ReservationStatus = "Reserved",
-                    CreatedAt = DateTime.UtcNow,
-                    CorrelationId = correlationId
-                };
+                    _logger.LogInformation(
+                        "Reserving inventory for customer {CustomerName}, amount {TotalAmount}",
+                        order.CustomerName,
+                        order.TotalAmount);
 
-                dbContext.InventoryReservations.Add(reservation);
+                    var reservation = new InventoryReservation
+                    {
+                        ReservationId = Guid.NewGuid(),
+                        OrderId = order.OrderId,
+                        CustomerName = order.CustomerName,
+                        TotalAmount = order.TotalAmount,
+                        ReservationStatus = "Reserved",
+                        CreatedAt = DateTime.UtcNow,
+                        CorrelationId = correlationId
+                    };
 
-                // STEP 4: Record event in Inbox.
-                dbContext.InboxMessages.Add(new InboxMessage
+                    dbContext.InventoryReservations.Add(reservation);
+
+                    dbContext.InboxMessages.Add(new InboxMessage
+                    {
+                        MessageId = eventId,
+                        ProcessedOnUtc = DateTime.UtcNow,
+                        ConsumerName = "InventoryConsumer",
+                        CorrelationId = correlationId
+                    });
+
+                    await dbContext.SaveChangesAsync(args.CancellationToken);
+                    await transaction.CommitAsync(args.CancellationToken);
+
+                    _logger.LogInformation(
+                        "Inventory reservation and Inbox record committed for OrderId {OrderId}, EventId {EventId}",
+                        order.OrderId,
+                        eventId);
+                }
+                catch
                 {
-                    MessageId = eventId,
-                    ProcessedOnUtc = DateTime.UtcNow,
-                    ConsumerName = "InventoryConsumer",
-                    CorrelationId = correlationId
-                });
-
-                await dbContext.SaveChangesAsync(args.CancellationToken);
-
-                // STEP 5: Commit reservation and Inbox together.
-                await transaction.CommitAsync(args.CancellationToken);
-
-                _logger.LogInformation(
-                    "Inventory reservation and Inbox committed. OrderId: {OrderId}, EventId: {EventId}",
-                    order.OrderId,
-                    eventId);
-            }
-            catch
-            {
-                // Rollback only when database processing fails
-                // before the transaction has successfully committed.
-                await transaction.RollbackAsync(args.CancellationToken);
-                throw;
+                    await transaction.RollbackAsync(CancellationToken.None);
+                    throw;
+                }
             }
 
-            // STEP 6: Complete Service Bus message AFTER SQL commit.
-            // This must not be inside the SQL transaction catch block.
-            await args.CompleteMessageAsync(args.Message);
-            _logger.LogInformation("Service Bus message completed. MessageId: {MessageId}", args.Message.MessageId);
+            // Complete only after the local SQL transaction has committed.
+            await args.CompleteMessageAsync(message, args.CancellationToken);
 
+            _logger.LogInformation(
+                "Service Bus message completed for OrderId {OrderId}, MessageId {MessageId}",
+                order.OrderId,
+                message.MessageId);
         }
-        catch (OperationCanceledException)
-            when (args.CancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (args.CancellationToken.IsCancellationRequested)
         {
             _logger.LogInformation(
-                "Inventory processing cancelled during shutdown.");
+                "Inventory message processing cancelled. MessageId: {MessageId}",
+                message.MessageId);
         }
         catch (Exception ex)
         {
             _logger.LogError(
                 ex,
-                "Inventory processing failed. MessageId: {MessageId}",
-                args.Message.MessageId);
+                "Inventory message processing failed. MessageId: {MessageId}",
+                message.MessageId);
 
-            await args.AbandonMessageAsync(args.Message);
+            // Abandon can itself fail if the message lock has expired or settlement
+            // has already happened. Log that separately without hiding the original error.
+            try
+            {
+                await args.AbandonMessageAsync(message, cancellationToken: CancellationToken.None);
+                _logger.LogWarning(
+                    "Inventory message abandoned for redelivery. MessageId: {MessageId}",
+                    message.MessageId);
+            }
+            catch (Exception settlementException)
+            {
+                _logger.LogError(
+                    settlementException,
+                    "Could not abandon inventory message. MessageId: {MessageId}",
+                    message.MessageId);
+            }
         }
     }
-
 
     private Task ProcessErrorAsync(ProcessErrorEventArgs args)
     {
         _logger.LogError(
             args.Exception,
-            "Inventory Service Bus error. Entity: {EntityPath}",
-            args.EntityPath);
+            "Azure Service Bus processor error. EntityPath: {EntityPath}, ErrorSource: {ErrorSource}, Namespace: {FullyQualifiedNamespace}",
+            args.EntityPath,
+            args.ErrorSource,
+            args.FullyQualifiedNamespace);
 
         return Task.CompletedTask;
+    }
+
+    private static string GetCorrelationId(ServiceBusReceivedMessage message)
+    {
+        if (!string.IsNullOrWhiteSpace(message.CorrelationId))
+        {
+            return message.CorrelationId;
+        }
+
+        if (message.ApplicationProperties.TryGetValue(
+                "CorrelationId",
+                out var correlationValue) &&
+            !string.IsNullOrWhiteSpace(correlationValue?.ToString()))
+        {
+            return correlationValue!.ToString()!;
+        }
+
+        // Fallback ensures every log record has a traceable identifier.
+        return message.MessageId;
     }
 }
