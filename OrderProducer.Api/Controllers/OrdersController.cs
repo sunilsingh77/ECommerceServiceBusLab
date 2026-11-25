@@ -25,9 +25,17 @@ public class OrdersController : ControllerBase
     [HttpPost]
     public async Task<IActionResult> CreateOrder(
         [FromQuery] string customerName = "John",
-        Guid? orderId = null,
+        [FromQuery] Guid? orderId = null,
         CancellationToken cancellationToken = default)
     {
+        var correlationId =
+            Request.Headers["X-Correlation-ID"].FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(correlationId))
+        {
+            correlationId = Guid.NewGuid().ToString("N");
+        }
+
         var orderEvent = new OrderCreatedEvent
         {
             OrderId = orderId ?? Guid.NewGuid(),
@@ -42,44 +50,43 @@ public class OrdersController : ControllerBase
 
         try
         {
-            // 1. Save business data.
             var order = new Order
             {
                 OrderId = orderEvent.OrderId,
                 CustomerName = orderEvent.CustomerName,
                 TotalAmount = orderEvent.TotalAmount,
-                CreatedAt = orderEvent.CreatedAt
+                CreatedAt = orderEvent.CreatedAt,
+                CorrelationId = correlationId
             };
 
             _dbContext.Orders.Add(order);
 
-            // 2. Save outgoing event in Outbox.
             var outboxMessage = new OutboxMessage
             {
                 Id = Guid.NewGuid(),
                 Type = nameof(OrderCreatedEvent),
                 Content = JsonSerializer.Serialize(orderEvent),
-                OccurredOnUtc = DateTime.UtcNow
+                OccurredOnUtc = DateTime.UtcNow,
+                CorrelationId = correlationId
             };
 
             _dbContext.OutboxMessages.Add(outboxMessage);
 
-            // 3. Persist both records.
             await _dbContext.SaveChangesAsync(cancellationToken);
-
-            // 4. Commit both records together.
             await transaction.CommitAsync(cancellationToken);
 
             _logger.LogInformation(
-                "Order {OrderId} and Outbox event {EventId} saved successfully.",
+                "Order {OrderId} saved to Outbox. EventId: {EventId}, CorrelationId: {CorrelationId}",
                 order.OrderId,
-                outboxMessage.Id);
+                outboxMessage.Id,
+                correlationId);
 
             return Accepted(new
             {
                 Message = "Order created and event stored in Outbox.",
                 order.OrderId,
                 EventId = outboxMessage.Id,
+                CorrelationId = correlationId,
                 Status = "PendingPublication"
             });
         }

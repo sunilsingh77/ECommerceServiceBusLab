@@ -1,5 +1,4 @@
-﻿
-using Azure.Messaging.ServiceBus;
+﻿using Azure.Messaging.ServiceBus;
 using ECommerce.Contracts;
 
 namespace OrderProducer.Api.Services;
@@ -18,28 +17,28 @@ public class ServiceBusPublisher : IAsyncDisposable
         _topicSender = client.CreateSender(topicName);
     }
 
-    // Module 2: Queue-based publishing
-    public async Task PublishOrderToQueueAsync(OrderCreatedEvent order, CancellationToken cancellationToken = default)
+    public async Task PublishOrderToQueueAsync(OrderCreatedEvent order, string? correlationId = null, CancellationToken cancellationToken = default)
     {
-        var message = CreateMessage(order);
+        var message = CreateMessage(order, correlationId);
         await _queueSender.SendMessageAsync(message, cancellationToken);
     }
 
-    // Module 3: Topic-based publishing
-    public async Task PublishOrderToTopicAsync(OrderCreatedEvent order, CancellationToken cancellationToken = default)
+    public async Task PublishOrderToTopicAsync(OrderCreatedEvent order, string? correlationId = null, CancellationToken cancellationToken = default)
     {
-        var message = CreateMessage(order);
+        var message = CreateMessage(order, correlationId);
         await _topicSender.SendMessageAsync(message, cancellationToken);
     }
 
-    private static ServiceBusMessage CreateMessage( OrderCreatedEvent order)
+    private static ServiceBusMessage CreateMessage(OrderCreatedEvent order, string? correlationId)
     {
-        return new ServiceBusMessage(BinaryData.FromObjectAsJson(order))
-        {
-            MessageId = order.OrderId.ToString(),
-            Subject = "OrderCreated",
-            ContentType = "application/json"
-        };
+        var msg = new ServiceBusMessage(BinaryData.FromObjectAsJson(order))
+                    {
+                        MessageId = order.OrderId.ToString(),
+                        Subject = "OrderCreated",
+                        ContentType = "application/json",
+                        CorrelationId = string.IsNullOrWhiteSpace(correlationId) ? order.OrderId.ToString() : correlationId
+                    };
+        return msg;
     }
 
     public async ValueTask DisposeAsync()

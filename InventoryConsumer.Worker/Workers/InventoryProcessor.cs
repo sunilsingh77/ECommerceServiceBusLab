@@ -67,8 +67,34 @@ public class InventoryProcessor : BackgroundService
     {
         try
         {
-            var order = args.Message.Body
-                .ToObjectFromJson<OrderCreatedEvent>();
+            var correlationId = args.Message.CorrelationId;
+
+            if (string.IsNullOrWhiteSpace(correlationId) &&
+                args.Message.ApplicationProperties.TryGetValue(
+                    "CorrelationId", out var correlationValue))
+            {
+                correlationId = correlationValue?.ToString();
+            }
+
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                correlationId = args.Message.MessageId;
+            }
+
+            using var logScope = _logger.BeginScope(
+                new Dictionary<string, object?>
+                {
+                    ["CorrelationId"] = correlationId,
+                    ["MessageId"] = args.Message.MessageId,
+                    ["Consumer"] = "InventoryConsumer"
+                });
+
+            _logger.LogInformation(
+                "Inventory message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
+                correlationId,
+                args.Message.MessageId);
+
+            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
 
             if (order is null ||
                 order.OrderId == Guid.Empty ||
@@ -119,11 +145,9 @@ public class InventoryProcessor : BackgroundService
                 return;
             }
 
-            // STEP 2: Start local InventoryDb transaction.
-            await using var transaction =
-                await dbContext.Database.BeginTransactionAsync(
-                    args.CancellationToken);
 
+            // STEP 2: Start local InventoryDb transaction.
+            await using var transaction = await dbContext.Database.BeginTransactionAsync(args.CancellationToken);
             try
             {
                 _logger.LogInformation(
@@ -139,7 +163,8 @@ public class InventoryProcessor : BackgroundService
                     CustomerName = order.CustomerName,
                     TotalAmount = order.TotalAmount,
                     ReservationStatus = "Reserved",
-                    CreatedAt = DateTime.UtcNow
+                    CreatedAt = DateTime.UtcNow,
+                    CorrelationId = correlationId
                 };
 
                 dbContext.InventoryReservations.Add(reservation);
@@ -149,7 +174,8 @@ public class InventoryProcessor : BackgroundService
                 {
                     MessageId = eventId,
                     ProcessedOnUtc = DateTime.UtcNow,
-                    ConsumerName = "InventoryConsumer"
+                    ConsumerName = "InventoryConsumer",
+                    CorrelationId = correlationId
                 });
 
                 await dbContext.SaveChangesAsync(args.CancellationToken);
@@ -161,17 +187,20 @@ public class InventoryProcessor : BackgroundService
                     "Inventory reservation and Inbox committed. OrderId: {OrderId}, EventId: {EventId}",
                     order.OrderId,
                     eventId);
-
-                // STEP 6: Complete Service Bus message.
-                await args.CompleteMessageAsync(args.Message);
-                // STEP 6: Complete Service Bus message.
-                await args.CompleteMessageAsync(args.Message);
             }
             catch
             {
+                // Rollback only when database processing fails
+                // before the transaction has successfully committed.
                 await transaction.RollbackAsync(args.CancellationToken);
                 throw;
             }
+
+            // STEP 6: Complete Service Bus message AFTER SQL commit.
+            // This must not be inside the SQL transaction catch block.
+            await args.CompleteMessageAsync(args.Message);
+            _logger.LogInformation("Service Bus message completed. MessageId: {MessageId}", args.Message.MessageId);
+
         }
         catch (OperationCanceledException)
             when (args.CancellationToken.IsCancellationRequested)

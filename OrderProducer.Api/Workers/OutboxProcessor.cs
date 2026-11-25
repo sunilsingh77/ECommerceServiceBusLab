@@ -44,8 +44,7 @@ public class OutboxProcessor : BackgroundService
         _logger.LogInformation("Outbox Processor stopped.");
     }
 
-    private async Task ProcessPendingMessagesAsync(
-        CancellationToken cancellationToken)
+    private async Task ProcessPendingMessagesAsync(CancellationToken cancellationToken)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
 
@@ -53,10 +52,10 @@ public class OutboxProcessor : BackgroundService
         var publisher = scope.ServiceProvider.GetRequiredService<ServiceBusPublisher>();
 
         var pendingMessages = await dbContext.OutboxMessages
-            .Where(x => x.ProcessedOnUtc == null)
-            .OrderBy(x => x.OccurredOnUtc)
-            .Take(10)
-            .ToListAsync(cancellationToken);
+                                            .Where(x => x.ProcessedOnUtc == null)
+                                            .OrderBy(x => x.OccurredOnUtc)
+                                            .Take(10)
+                                            .ToListAsync(cancellationToken);
 
         foreach (var outboxMessage in pendingMessages)
         {
@@ -71,7 +70,7 @@ public class OutboxProcessor : BackgroundService
                     ?? throw new InvalidOperationException("Could not deserialize OrderCreatedEvent.");
 
                 // Publish to the existing orders-topic.
-                await publisher.PublishOrderToTopicAsync(orderEvent, cancellationToken);
+                await publisher.PublishOrderToTopicAsync(orderEvent, outboxMessage.CorrelationId, cancellationToken);
 
                 // Mark as processed only after successful publishing.
                 outboxMessage.ProcessedOnUtc = DateTime.UtcNow;
@@ -79,7 +78,7 @@ public class OutboxProcessor : BackgroundService
 
                 await dbContext.SaveChangesAsync(cancellationToken);
 
-                _logger.LogInformation("Outbox event {EventId} published successfully. OrderId: {OrderId}", outboxMessage.Id, orderEvent.OrderId);
+                _logger.LogInformation("Outbox event {EventId} published successfully. OrderId: {OrderId}, CorrelationId: {CorrelationId}", outboxMessage.Id, orderEvent.OrderId, outboxMessage.CorrelationId);
             }
             catch (OperationCanceledException)  when (cancellationToken.IsCancellationRequested)
             {

@@ -8,4 +8,5 @@ public class InventoryReservation
     public decimal TotalAmount { get; set; }
     public string ReservationStatus { get; set; } = "Reserved";
     public DateTime CreatedAt { get; set; }
+    public string? CorrelationId { get; set; }
 }

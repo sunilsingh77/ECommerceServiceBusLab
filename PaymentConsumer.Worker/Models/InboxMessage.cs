@@ -7,4 +7,6 @@ public class InboxMessage
     public DateTime ProcessedOnUtc { get; set; }
 
     public string ConsumerName { get; set; } = string.Empty;
+
+    public string? CorrelationId { get; set; }
 }

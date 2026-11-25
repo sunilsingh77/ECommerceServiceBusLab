@@ -90,6 +90,33 @@ public class PaymentProcessor : BackgroundService
     {
         try
         {
+            var correlationId = args.Message.CorrelationId;
+
+            if (string.IsNullOrWhiteSpace(correlationId) &&
+                args.Message.ApplicationProperties.TryGetValue(
+                    "CorrelationId", out var correlationValue))
+            {
+                correlationId = correlationValue?.ToString();
+            }
+
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                correlationId = args.Message.MessageId;
+            }
+
+            using var logScope = _logger.BeginScope(
+                new Dictionary<string, object?>
+                {
+                    ["CorrelationId"] = correlationId,
+                    ["MessageId"] = args.Message.MessageId,
+                    ["Consumer"] = "PaymentConsumer"
+                });
+
+            _logger.LogInformation(
+                "Payment message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
+                correlationId,
+                args.Message.MessageId);
+
             var order = args.Message.Body
                 .ToObjectFromJson<OrderCreatedEvent>();
 
@@ -155,6 +182,7 @@ public class PaymentProcessor : BackgroundService
                     order.OrderId,
                     order.CustomerName,
                     order.TotalAmount,
+                    correlationId,
                     args.CancellationToken);
 
                 _logger.LogInformation(
@@ -166,7 +194,8 @@ public class PaymentProcessor : BackgroundService
                 {
                     MessageId = eventId,
                     ProcessedOnUtc = DateTime.UtcNow,
-                    ConsumerName = "PaymentConsumer"
+                    ConsumerName = "PaymentConsumer",
+                    CorrelationId = correlationId
                 });
 
                 await dbContext.SaveChangesAsync(args.CancellationToken);
@@ -199,7 +228,7 @@ public class PaymentProcessor : BackgroundService
             }
             catch
             {
-                await transaction.RollbackAsync(args.CancellationToken);
+                //await transaction.RollbackAsync(args.CancellationToken);
                 throw;
             }
         }

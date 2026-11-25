@@ -8,4 +8,7 @@ public class OutboxMessage
     public DateTime OccurredOnUtc { get; set; }
     public DateTime? ProcessedOnUtc { get; set; }
     public string? Error { get; set; }
+
+    // New property
+    public string? CorrelationId { get; set; }
 }

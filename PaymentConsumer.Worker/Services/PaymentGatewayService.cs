@@ -23,6 +23,7 @@ public class PaymentGatewayService
         Guid orderId,
         string customerName,
         decimal amount,
+        string? correlationId,
         CancellationToken cancellationToken)
     {
         // Step 1: Check whether payment already exists.
@@ -81,7 +82,8 @@ public class PaymentGatewayService
             PaymentStatus = "Succeeded",
             PaymentReference = $"PAY-{Guid.NewGuid():N}",
             CreatedAt = DateTime.UtcNow,
-            UpdatedAt = DateTime.UtcNow
+            UpdatedAt = DateTime.UtcNow,
+            CorrelationId = correlationId
         };
 
         _dbContext.PaymentTransactions.Add(payment);

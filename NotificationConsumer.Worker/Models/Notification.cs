@@ -9,4 +9,5 @@ public class Notification
     public string NotificationStatus { get; set; } = "Pending";
     public DateTime CreatedAt { get; set; }
     public DateTime? SentAt { get; set; }
+    public string? CorrelationId { get; set; }
 }

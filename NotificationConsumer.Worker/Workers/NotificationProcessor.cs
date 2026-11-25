@@ -72,6 +72,33 @@ public class NotificationProcessor : BackgroundService
     {
         try
         {
+            var correlationId = args.Message.CorrelationId;
+
+            if (string.IsNullOrWhiteSpace(correlationId) &&
+                args.Message.ApplicationProperties.TryGetValue(
+                    "CorrelationId", out var correlationValue))
+            {
+                correlationId = correlationValue?.ToString();
+            }
+
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                correlationId = args.Message.MessageId;
+            }
+
+            using var logScope = _logger.BeginScope(
+                new Dictionary<string, object?>
+                {
+                    ["CorrelationId"] = correlationId,
+                    ["MessageId"] = args.Message.MessageId,
+                    ["Consumer"] = "NotificationConsumer"
+                });
+
+            _logger.LogInformation(
+                "Notification message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
+                correlationId,
+                args.Message.MessageId);
+
             var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
 
             if (order is null ||
@@ -134,7 +161,8 @@ public class NotificationProcessor : BackgroundService
                     CustomerName = order.CustomerName,
                     NotificationType = "OrderConfirmation",
                     NotificationStatus = "Pending",
-                    CreatedAt = DateTime.UtcNow
+                    CreatedAt = DateTime.UtcNow,
+                    CorrelationId = correlationId
                 };
 
                 dbContext.Notifications.Add(notification);
@@ -144,7 +172,8 @@ public class NotificationProcessor : BackgroundService
                 {
                     MessageId = eventId,
                     ProcessedOnUtc = DateTime.UtcNow,
-                    ConsumerName = "NotificationConsumer"
+                    ConsumerName = "NotificationConsumer",
+                    CorrelationId = correlationId
                 });
 
                 await dbContext.SaveChangesAsync(args.CancellationToken);

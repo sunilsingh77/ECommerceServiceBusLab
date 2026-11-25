@@ -52,8 +52,33 @@ public class Worker : BackgroundService
     {
         try
         {
-            var order = args.Message.Body
-                .ToObjectFromJson<OrderCreatedEvent>();
+            var correlationId = args.Message.CorrelationId;
+
+            if (string.IsNullOrWhiteSpace(correlationId) &&
+                args.Message.ApplicationProperties.TryGetValue(
+                    "CorrelationId", out var correlationValue))
+            {
+                correlationId = correlationValue?.ToString();
+            }
+
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                correlationId = args.Message.MessageId;
+            }
+
+            using var logScope = _logger.BeginScope(
+                new Dictionary<string, object?>
+                {
+                    ["CorrelationId"] = correlationId,
+                    ["MessageId"] = args.Message.MessageId,
+                    ["Consumer"] = "OrderConsumer"
+                });
+
+            _logger.LogInformation(
+                "Order message received. CorrelationId: {CorrelationId}, OrderId: {OrderId}",
+                correlationId,
+                args.Message.MessageId);
+            var order = args.Message.Body.ToObjectFromJson<OrderCreatedEvent>();
 
             // Scenario 1: Invalid message - permanent failure
             if (order is null || order.OrderId == Guid.Empty || string.IsNullOrWhiteSpace(order.CustomerName) || order.TotalAmount <= 0)
@@ -71,11 +96,12 @@ public class Worker : BackgroundService
             }
 
             _logger.LogInformation(
-                "Processing Order: {OrderId}, Customer: {Customer}, Amount: {Amount}, DeliveryCount: {DeliveryCount}",
+                "Processing Order: {OrderId}, Customer: {Customer}, Amount: {Amount}, DeliveryCount: {DeliveryCount}, CorrelationId: {CorrelationId}",
                 order.OrderId,
                 order.CustomerName,
                 order.TotalAmount,
-                args.Message.DeliveryCount);
+                args.Message.DeliveryCount,
+                correlationId);
 
             // Scenario 2: Simulate temporary processing failure
             if (order.CustomerName.Equals("FAIL", StringComparison.OrdinalIgnoreCase))
@@ -91,15 +117,17 @@ public class Worker : BackgroundService
             await Task.Delay(1000, args.CancellationToken);
 
             _logger.LogInformation(
-                "Order processed successfully: {OrderId}",
-                order.OrderId);
+                "Order processed successfully. OrderId: {OrderId}, CorrelationId: {CorrelationId}",
+                order.OrderId,
+                correlationId);
 
             // Scenario 3: Successful processing
             await args.CompleteMessageAsync(args.Message);
 
             _logger.LogInformation(
-                "Message completed successfully: {MessageId}",
-                args.Message.MessageId);
+                "Message completed successfully. MessageId: {MessageId}, CorrelationId: {CorrelationId}",
+                args.Message.MessageId,
+                correlationId);
         }
         catch (OperationCanceledException)
             when (args.CancellationToken.IsCancellationRequested)
