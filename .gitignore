@@ -50,3 +50,6 @@ Thumbs.db
 
 # Azure local settings
 local.settings.json
+/InventoryConsumer.Worker/logs
+/NotificationConsumer.Worker/logs
+/PaymentConsumer.Worker/logs
